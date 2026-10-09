@@ -1,0 +1,21 @@
+# 本地测试/开发辅助脚本(不发布)
+_test_*.sh
+_local_*.sh
+_verify_*.py
+
+# 测试用离线包与用例
+_tmp/
+fixtures/private/
+
+# Python
+__pycache__/
+*.pyc
+
+# 日志
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.bak

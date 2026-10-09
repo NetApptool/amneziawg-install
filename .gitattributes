@@ -1,0 +1,9 @@
+# 强制 shell 脚本和 yml 用 LF 行尾(Linux/macOS 可执行)
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# 文档文件用平台默认行尾
+*.md   text
+LICENSE text
+.gitignore text
