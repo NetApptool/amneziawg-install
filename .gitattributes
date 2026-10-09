@@ -1,7 +1,9 @@
-# 强制 shell 脚本和 yml 用 LF 行尾(Linux/macOS 可执行)
+# 强制 shell 脚本 / 配置样例 / CI 用 LF 行尾
+# (Linux 上必须有可执行位; 配置样例被 awk 解析, 行尾不稳会干扰测试)
 *.sh   text eol=lf
 *.yml  text eol=lf
 *.yaml text eol=lf
+*.conf text eol=lf
 
 # 文档文件用平台默认行尾
 *.md   text
