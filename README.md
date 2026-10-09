@@ -8,37 +8,10 @@
 
 ---
 
-## 先把脚本弄到目标机（⚠️ 本仓库是私有仓库）
-
-> **私有仓库的 raw 链接匿名访问会 404** —— 直接 `curl https://raw.githubusercontent.com/...` 拉不到东西。
-> 三条路任选：
-
-**A) 从已有副本直接传（最省事，目标机不需要任何 GitHub 凭据）**
-
-```bash
-scp amneziawg-install.sh root@<目标机>:/tmp/awg-install.sh
-ssh root@<目标机> 'sudo bash /tmp/awg-install.sh'
-```
-
-**B) 带 token 拉**（私有仓库唯一能 curl 通的写法）
-
-```bash
-curl -fsSL -H "Authorization: Bearer <YOUR_PAT>" \
-  https://raw.githubusercontent.com/NetApptool/amneziawg-install/main/amneziawg-install.sh \
-  -o /tmp/awg-install.sh
-sudo bash /tmp/awg-install.sh
-```
-
-> ⚠️ **`-H "Authorization: ..."` 只写在命令行里，绝不写进任何脚本、镜像或仓库文件**；
-> 命令行参数会短时出现在本机 `ps` 里，共享机器上先 `scp` 更稳。
-
-**C) 临时把仓库改 public**，用完再改回 private（不建议，容易忘）。
-
----
-
 ## 30 秒上手
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/NetApptool/amneziawg-install/main/amneziawg-install.sh -o /tmp/awg-install.sh
 sudo bash /tmp/awg-install.sh
 # 粘贴你的 AmneziaWG 配置（必须带 Jc/Jmin/Jmax/S1/S2/H1-H4 混淆字段），按 Ctrl+D 结束
 ```
@@ -54,6 +27,19 @@ sudo bash /tmp/awg-install.sh --config /root/awg0.conf --yes --ifname awg0
 ```bash
 bash amneziawg-install.sh --validate-config ./awg0.conf
 ```
+
+### 目标机拉不到 GitHub 时（内网 / 信创 / 无外网）
+
+脚本不依赖任何私网资源，把文件拷过去一样跑：
+
+```bash
+scp amneziawg-install.sh root@<目标机>:/tmp/awg-install.sh
+ssh root@<目标机> 'sudo bash /tmp/awg-install.sh'
+```
+
+> 极端情况（`awg` 二进制都拉不到）：先在一台联网机器上按 README 的源码路线编译，
+> 把 `awg` / `awg-quick` / `amneziawg-go` 三个二进制拷进 `/usr/bin/`，再跑本脚本的
+> `--config` 模式 —— 脚本检测到已装好的命令会跳过安装步骤。
 
 ---
 

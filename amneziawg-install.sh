@@ -4,18 +4,14 @@
 # Project : https://github.com/NetApptool/amneziawg-install
 # License : MIT
 #
-# ⚠️ 本仓库是【私有】仓库 —— 匿名 curl raw 链接会返回 404, 拉不到脚本。
-#    先把脚本弄到目标机, 三条路任选(详见 README「先把脚本弄到目标机」):
-#      A) 从已有副本直接传   scp amneziawg-install.sh root@目标机:/tmp/awg-install.sh
-#      B) 带 token 拉(不要把 token 写进任何仓库文件):
-#           curl -fsSL -H "Authorization: Bearer <YOUR_PAT>" \
-#             https://raw.githubusercontent.com/NetApptool/amneziawg-install/main/amneziawg-install.sh -o /tmp/awg-install.sh
-#      C) 临时把仓库改公开(不建议)
-#
 # Usage:
+#   curl -fsSL https://raw.githubusercontent.com/NetApptool/amneziawg-install/main/amneziawg-install.sh -o /tmp/awg-install.sh
 #   sudo bash /tmp/awg-install.sh                       # 交互: 粘贴配置 + Ctrl+D
 #   sudo bash /tmp/awg-install.sh --config /root/awg0.conf
 #   bash /tmp/awg-install.sh --validate-config ./awg0.conf   # 免 root 只校验
+#
+# 目标机拉不到 GitHub(内网/信创): 直接把脚本文件 scp 过去跑, 效果完全一样。
+#   脚本不依赖任何私网资源; awg 二进制也拉不到时, 先在联网机器上编译好再拷 /usr/bin/。
 #
 # Tested on:
 #   Ubuntu 22.04+ / Debian 12 / Rocky 9 / RHEL 9 / AlmaLinux 9 /
@@ -56,23 +52,13 @@ usage() {
     cat <<EOF
 amneziawg-install v$VERSION  跨发行版 AmneziaWG 客户端一键安装脚本
 
-⚠️ 本仓库是私有仓库 —— 匿名 curl raw 链接会 404。先把脚本弄到目标机再跑:
-
-  A) 从已有副本直接传(最省事, 目标机不需要 GitHub 凭据):
-       scp amneziawg-install.sh root@<目标机>:/tmp/awg-install.sh
-       ssh root@<目标机> 'sudo bash /tmp/awg-install.sh'
-
-  B) 带 token 拉(私有仓库唯一能 curl 通的写法, 别把 token 落到任何文件里):
-       curl -fsSL -H "Authorization: Bearer <YOUR_PAT>" \\
-         https://raw.githubusercontent.com/NetApptool/amneziawg-install/main/amneziawg-install.sh \\
-         -o /tmp/awg-install.sh && sudo bash /tmp/awg-install.sh
-
-  C) 临时把仓库改 public, 用完再改回 private(不建议)
-
 Usage:
+  curl -fsSL https://raw.githubusercontent.com/NetApptool/amneziawg-install/main/amneziawg-install.sh -o /tmp/awg-install.sh
   sudo bash /tmp/awg-install.sh                       # 交互: 粘贴配置 + Ctrl+D
   sudo bash /tmp/awg-install.sh --config /root/awg0.conf
   bash /tmp/awg-install.sh --validate-config ./awg0.conf   # 免 root 只校验配置
+
+  目标机拉不到 GitHub(内网/信创): scp 把本脚本传过去跑, 效果一样。
 
 Options:
   -h, --help              显示本帮助
