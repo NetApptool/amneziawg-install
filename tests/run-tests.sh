@@ -74,6 +74,31 @@ for c in "${CASES[@]}"; do
     run_case "$c"
 done
 
+# ---------- 特殊用例: CRLF(Windows)行尾必须能被自动归一化 ----------
+# 这个用例的输入在运行时生成, 仓库里保持 LF 干净
+CRLF_TMP=$(mktemp /tmp/awg-crlf.XXXXXX)
+trap 'rm -f "$CRLF_TMP"' EXIT
+sed 's/$/\r/' "$FIXTURES/good-amneziawg.conf" > "$CRLF_TMP"
+out=$(bash "$SCRIPT" --validate-config "$CRLF_TMP" 2>&1)
+rc=$?
+problems=""
+if [ "$rc" != 0 ]; then
+    problems="退出码期望 0 实际 $rc"
+fi
+if ! printf '%s' "$out" | grep -qF "CR 字符"; then
+    problems="$problems; 没有提示检测到 CR(Windows 行尾)"
+fi
+if [ -z "$problems" ]; then
+    printf '  \033[0;32mPASS\033[0m  %-26s (退出码 %s)\n' "good-amneziawg.conf(CRLF)" "$rc"
+    PASS=$((PASS + 1))
+else
+    printf '  \033[0;31mFAIL\033[0m  %-26s ->%s\n' "good-amneziawg.conf(CRLF)" "$problems"
+    printf '        ---- 实际输出 ----\n'
+    printf '%s\n' "$out" | sed 's/^/        /'
+    printf '        ------------------\n'
+    FAIL=$((FAIL + 1))
+fi
+
 echo
 echo "结果: 通过 $PASS, 失败 $FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

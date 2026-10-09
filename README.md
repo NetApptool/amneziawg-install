@@ -157,6 +157,8 @@ flowchart TB
 - **MTU 提示**：全流量且未设 MTU 时建议写 `MTU = 1280`（经 4G/5G 拨入必须 ≤1280，否则能握手但打不开网页）
 - **Kill Switch**（可选）：用 `awg show %i fwmark` 取 fwmark，不是 `wg show`
 - **旧配置自动备份**：覆盖前存成 `awg0.conf.bak.<时间戳>`
+- **CRLF 行尾自动归一化**：Windows 上编辑/传过来的配置，行尾回车符会被 `awg-quick` 当成配置值的一部分
+  （`PrivateKey` 变 `xxx=\r`）而连不上且报错不提原因 —— 脚本检测到就自动转成 LF，并明确告诉你转了几处
 
 ---
 
@@ -203,7 +205,8 @@ bash tests/run-tests.sh        # 配置校验器回归测试(纯离线, 无需 r
 ```
 
 用例覆盖：完整配置通过、全流量+MTU 通过、标准 WG 配置被拦、GL.iNet 残缺配置被拦、
-H 区间重叠被拦、数值越界/约束冲突被拦、缺客户端本地参数只提示、缺关键键被拦。
+H 区间重叠被拦、数值越界/约束冲突被拦、缺客户端本地参数只提示、缺关键键被拦、
+CRLF（Windows）行尾自动归一化。
 
 CI：`.github/workflows/shellcheck.yml`（`bash -n` + shellcheck，severity=warning 即失败）。
 

@@ -404,6 +404,27 @@ validate_config() {
     return 0
 }
 
+# CRLF → LF 归一化
+#   为什么必须做: awg-quick 用 bash 逐行解析配置, 行尾的 \r 会**留在值里** ——
+#   PrivateKey 变成 "xxx=\r"、Address 变成 "10.1.0.3/24\r" → 密钥解析失败 / ip address add 失败,
+#   而报错信息不会提 \r, 极难排查。Windows 上编辑/传输过来的配置非常常见。
+#   注意: 用 tr 而不是 awk 做检测 —— awk 在 Windows(文本模式) 会把 CRLF 读成 LF,
+#   检测永远为 0, 而 tr 始终按二进制处理。
+normalize_crlf() {
+    local f="$1" n tmpf
+    n=$(tr -cd '\r' < "$f" 2>/dev/null | wc -c | tr -d '[:space:]')
+    if [ "${n:-0}" -gt 0 ]; then
+        warn "配置里有 $n 个 CR 字符(Windows 行尾) —— 已自动转成 LF; 否则 awg-quick 解析时会把行尾回车符带进值里, 连不上还查不出原因"
+        tmpf="$f.lf.$$"
+        if tr -d '\r' < "$f" > "$tmpf" 2>/dev/null; then
+            mv "$tmpf" "$f"
+        else
+            rm -f "$tmpf"
+            warn "CRLF 转换失败, 请手工执行 dos2unix 后重试"
+        fi
+    fi
+}
+
 # ============================================================
 # --validate-config: 只校验, 不装东西
 # ============================================================
@@ -413,7 +434,12 @@ if [ -n "$VALIDATE_ONLY" ]; then
         exit 2
     fi
     echo "校验配置: $VALIDATE_ONLY"
-    if validate_config "$VALIDATE_ONLY"; then
+    # 校验用副本, 绝不改动用户给的原文件
+    VCHECK=$(mktemp /tmp/awg-check.XXXXXX)
+    trap 'rm -f "$VCHECK"' EXIT
+    cat "$VALIDATE_ONLY" > "$VCHECK"
+    normalize_crlf "$VCHECK"
+    if validate_config "$VCHECK"; then
         if [ "$VAL_ERRORS" -gt 0 ]; then
             echo "结果: 不通过(错误 $VAL_ERRORS, 提示 $VAL_WARNINGS)"
             exit 1
@@ -865,6 +891,9 @@ else
 fi
 
 [ -s "$CONF_TMP" ] || die "配置为空"
+
+# 行尾归一化(Windows 编辑过的配置会把 \r 带进值里, 详见 normalize_crlf 注释)
+normalize_crlf "$CONF_TMP"
 
 if ! validate_config "$CONF_TMP"; then
     echo
