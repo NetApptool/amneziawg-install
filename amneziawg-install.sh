@@ -41,6 +41,7 @@ IMPL="auto"                   # auto | kernel | userspace
 ASSUME_YES=0                  # --yes: 所有交互取默认值
 START_NOW="ask"               # ask | yes | no
 VALIDATE_ONLY=""              # --validate-config <file>: 只校验配置后退出
+SET_ENDPOINT=""               # --set-endpoint host:port: 覆盖配置里的 Endpoint(DDNS 失效时的应急手段)
 ALLOW_INCOMPLETE=0            # --allow-incomplete: 允许缺少混淆字段继续
 AWG_DIR="/etc/amnezia/amneziawg"
 LOG_FILE="/tmp/amneziawg-install.log"
@@ -71,6 +72,7 @@ Options:
       --no-start          写入配置但不启动隧道、不开机自启
       --validate-config F 只校验配置文件的合法性并退出(不装任何东西)
       --allow-incomplete  允许混淆字段不全的配置继续(不推荐)
+      --set-endpoint H:P  覆盖配置里的 Endpoint(DDNS 域名失效时的应急手段)
 
 Features:
   - 自动识别发行版并装 amneziawg-tools(提供 awg / awg-quick)
@@ -99,6 +101,7 @@ while [ $# -gt 0 ]; do
         --no-start)         START_NOW="no"; shift ;;
         --validate-config)  VALIDATE_ONLY="${2:-}"; [ -n "$VALIDATE_ONLY" ] || { echo "缺少 --validate-config 的文件名" >&2; exit 2; }; shift 2 ;;
         --allow-incomplete) ALLOW_INCOMPLETE=1; shift ;;
+        --set-endpoint)     SET_ENDPOINT="${2:-}"; [ -n "$SET_ENDPOINT" ] || { echo "缺少 --set-endpoint 的 host:port" >&2; exit 2; }; shift 2 ;;
         *) echo "未知参数: $1  (用 --help 查看用法)" >&2; exit 2 ;;
     esac
 done
@@ -1009,6 +1012,29 @@ CONF_MTU=$(conf_get "$CONF_TMP" Interface MTU)
 [ -n "$ENDPOINT" ] || die "配置无效: 未找到 Endpoint"
 [ -n "$ADDRESS" ]  || die "配置无效: 未找到 Address"
 
+# --set-endpoint: 覆盖 Endpoint(DDNS 域名失效时的应急手段; 改的是要落盘的副本, 不动用户原文件)
+if [ -n "$SET_ENDPOINT" ]; then
+    if ! printf '%s' "$SET_ENDPOINT" | grep -qE ':[0-9]{1,5}$'; then
+        die "--set-endpoint 需要 host:port 形式, 例如 203.0.113.7:51820"
+    fi
+    warn "按 --set-endpoint 覆盖 Endpoint: $ENDPOINT  →  $SET_ENDPOINT"
+    TMP_E=$(mktemp)
+    if awk -v ep="$SET_ENDPOINT" '
+        /^[[:space:]]*\[/ { if ($0 ~ /\[Peer\]/) ins=1 }
+        { if (ins && !done && $0 ~ /^[[:space:]]*Endpoint[[:space:]]*=/) { print "Endpoint = " ep; done=1; next } print }
+    ' "$CONF_TMP" > "$TMP_E"; then
+        mv "$TMP_E" "$CONF_TMP"
+        ENDPOINT="$SET_ENDPOINT"
+        info "已覆盖。注意: 写死 IP 后服务端换 IP 就会失效(DDNS 的意义正在于此)"
+    else
+        rm -f "$TMP_E"
+        die "Endpoint 覆盖失败(未在 [Peer] 段找到 Endpoint 行)"
+    fi
+fi
+
+ENDPOINT_HOST="${ENDPOINT%:*}"
+ENDPOINT_PORT="${ENDPOINT##*:}"
+
 FULL_TUNNEL=0
 if printf '%s' "$ALLOWED" | grep -q '0\.0\.0\.0/0'; then
     FULL_TUNNEL=1
@@ -1282,39 +1308,76 @@ info "想改配置: sudo vi $CFG_PATH 然后 sudo awg-quick down $IFNAME && sudo
 # ---------- [6/7] 启动 ----------
 EXIT_IP=""; HANDSHAKE_OK=0; MODE_ACTUAL=""
 
+# 解析主机名 → IP。只用 getent / ping 两条路:
+#   不用 nslookup —— 它的输出里第一个 Address 是 DNS 服务器自己的地址,
+#   解析失败时照样打出来, 按行取会得到"假阳性 IP", 比不解析更危险。
+resolve_ip() {  # resolve_ip <host>  -> 成功打印 IP 并 return 0
+    local h="$1" got=""
+    if command -v getent >/dev/null 2>&1; then
+        got=$(getent hosts "$h" 2>/dev/null | awk 'NR==1{print $1}')
+        [ -n "$got" ] && { printf '%s' "$got"; return 0; }
+    fi
+    if command -v ping >/dev/null 2>&1; then
+        got=$(ping -c1 -W2 "$h" 2>/dev/null | head -n1 | sed -n 's/.*(\([0-9][0-9.]*\)).*/\1/p')
+        [ -n "$got" ] && { printf '%s' "$got"; return 0; }
+    fi
+    return 1
+}
+
 # 启动前的 Endpoint 预检: awg setconf 会自己解析 Endpoint 主机名, 解析不了就报
 #   "Name or service not known: `host:port'" + "Configuration parsing error"
-# —— 这是最容易被误读成"配置写错了"的一类失败(其实配置没问题, 是本机 DNS 解析不了)。
-# 提前查一次, 把真正的原因和查法摊给用户; 也提前给出"改用 IP"的绕法。
-ENDPOINT_HOST="${ENDPOINT%:*}"
-ENDPOINT_PORT="${ENDPOINT##*:}"
+# —— 这是最容易被误读成"配置写错了"的一类失败(配置其实没问题)。
+# 关键是要**分清两种完全不同的病因**, 处置办法正好相反:
+#   ① 本机 DNS 整体不通  → 修 /etc/resolv.conf 就行
+#   ② DNS 好好的, 但这个名字就是不存在(DDNS 记录已失效/名字写错)
+#      → 修本机 DNS 一点用没有, 必须去服务端重新注册 DDNS 或改用当前公网 IP 写死
 preflight_endpoint() {
-    # 已经是 IP 就不需要解析
     if printf '%s' "$ENDPOINT_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
        || printf '%s' "$ENDPOINT_HOST" | grep -q ':'; then
         ok "Endpoint 是 IP, 不需要 DNS 解析"
         return 0
     fi
-    if getent hosts "$ENDPOINT_HOST" >/dev/null 2>&1; then
-        local ip; ip=$(getent hosts "$ENDPOINT_HOST" | awk 'NR==1{print $1}')
+    local ip
+    if ip=$(resolve_ip "$ENDPOINT_HOST") && [ -n "$ip" ]; then
         ok "Endpoint 域名可解析: $ENDPOINT_HOST -> $ip"
         return 0
     fi
+
     warn "Endpoint 域名【解析不了】: $ENDPOINT_HOST"
-    info "这正是 \`Name or service not known' + \`Configuration parsing error' 的原因 ——"
-    info "不是配置写错了, 是这台机器现在解析不了这个名字(awg setconf 会自己解析 Endpoint)。"
+    info "这正是 \`Name or service not known' + \`Configuration parsing error' 的原因(awg setconf 会自己解析 Endpoint)。"
     echo
-    echo "  按顺序自查:"
-    echo "    cat /etc/resolv.conf          # 有没有可用 nameserver(只有 127.0.0.53 时看 systemd-resolved 是否活着)"
-    echo "    ping -c2 223.5.5.5            # 纯 IP 通不通(分清'没网'还是'只有 DNS 坏')"
-    echo "    getent hosts $ENDPOINT_HOST   # 换个工具复验"
+    # 判病因: 先看同名父域能不能解析(能 → 本机 DNS 是好的, 是这条记录不存在),
+    # 再拿 example.com 兜底(父域本身也查不到时用)
+    local parent="${ENDPOINT_HOST#*.}" healthy=0 probe=""
+    if [ -n "$parent" ] && [ "$parent" != "$ENDPOINT_HOST" ] && resolve_ip "$parent" >/dev/null 2>&1; then
+        healthy=1; probe="$parent(父域)"
+    elif resolve_ip example.com >/dev/null 2>&1; then
+        healthy=1; probe="example.com"
+    fi
+
+    if [ "$healthy" = 1 ]; then
+        err "病因判定: 本机 DNS 是【好的】($probe 能解析), 是【这个名字本身解析不出来】"
+        echo "        · 常见成因: 服务端的 DDNS 记录已失效/被回收、域名拼写有误、或该 DDNS 需要在服务端重新注册"
+        echo "        · 这时修本机 DNS 没有任何用 —— 要去服务端解决, 或用下面的 IP 直连应急"
+        echo
+        echo "  应急(立刻能用): 找到服务端【当前公网 IP】, 用它替换域名:"
+        echo "    sudo bash $0 --config <你的配置> --set-endpoint <当前公网IP>:$ENDPOINT_PORT"
+        echo "    或直接改配置: Endpoint = <当前公网IP>:$ENDPOINT_PORT 然后"
+        echo "      sudo awg-quick down $IFNAME && sudo awg-quick up $IFNAME"
+        echo "  取当前公网 IP 的三个办法:"
+        echo "    · 在服务端(路由器/机器)上看 WAN 口地址"
+        echo "    · 让服务端访问 https://api.ipify.org 看出口 IP"
+        echo "    · 服务端管理界面里的 DDNS/状态页(那里也会显示 DDNS 是否注册成功)"
+        echo "  ⚠️ DDNS 换过 IP 后写死的 IP 会失效, 属临时手段"
+    else
+        err "病因判定: 本机 DNS 【整体不通】($ENDPOINT_HOST 与 example.com 都解析不了)"
+        echo "        · 查: cat /etc/resolv.conf   (有没有可用 nameserver)"
+        echo "        · 查: ping -c2 223.5.5.5     (纯 IP 通不通 —— 分清'没网'还是'只有 DNS 坏')"
+        echo "        · 修: 往 /etc/resolv.conf 加一行 nameserver 223.5.5.5 再重跑本脚本"
+    fi
     echo
-    echo "  两条绕法:"
-    echo "    A) 修好 DNS 再重跑本脚本"
-    echo "    B) 找台能解析的机器查出 IP, 把配置改成 IP 直连:"
-    echo "         Endpoint = <IP>:$ENDPOINT_PORT"
-    echo "       改完: sudo awg-quick down $IFNAME && sudo awg-quick up $IFNAME"
-    echo "       (DDNS 换 IP 后要再改一次, 属临时手段; 根治还是修 DNS)"
+    echo "  ⚠️ 若本机 DNS 本来就依赖隧道自身(配置里的 DNS = 那行), 会是先有鸡还是先有蛋:"
+    echo "     必须先用 IP 把隧道起起来, 域名才会通。"
     return 1
 }
 
