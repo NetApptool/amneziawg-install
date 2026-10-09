@@ -16,7 +16,7 @@ jobs:
         run: bash -n amneziawg-install.sh
 
       - name: ShellCheck
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@2.0.0
         with:
           severity: warning
           ignore_paths: ".github"

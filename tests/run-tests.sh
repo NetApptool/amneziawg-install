@@ -24,8 +24,11 @@ CASES=(
     "plain-wireguard.conf|1|没有任何 AmneziaWG 混淆字段"
     "glinet-incomplete.conf|1|混淆字段残缺"
     "h-overlap.conf|1|H 字段区间重叠"
-    "bad-numbers.conf|1|Jmin(80) 必须小于 Jmax(10)"
+    "bad-numbers.conf|1|Jmin(80) 不能大于 Jmax(10)"
     "no-jc.conf|0|缺少客户端本地混淆参数"
+    "jmin-eq-jmax.conf|0|"
+    "s-conflict.conf|0|S1+56 恰好等于 S2"
+    "peer-first-indented.conf|0|"
     "missing-keys.conf|1|缺少"
 )
 
@@ -96,6 +99,27 @@ else
     printf '        ---- 实际输出 ----\n'
     printf '%s\n' "$out" | sed 's/^/        /'
     printf '        ------------------\n'
+    FAIL=$((FAIL + 1))
+fi
+
+# ---------- 静态守卫: 安装路径必须经过唯一的校验闸 ----------
+# 为什么要有这条: 早期版本 validate_config() 恒 return 0, 而主流程只看函数返回码,
+# 于是"拦住残废配置"这个核心承诺在**安装路径**上完全失效 —— 但 --validate-config
+# 路径单独读 VAL_ERRORS, 所以整个测试套件照样全绿。行为测试测不到这条, 只能用源码级断言钉住。
+echo
+echo "静态守卫(安装路径必须走 config_gate):"
+if grep -q 'if ! config_gate "\$CONF_TMP"; then' "$SCRIPT"; then
+    printf '  \033[0;32mPASS\033[0m  安装路径调用 config_gate\n'
+    PASS=$((PASS + 1))
+else
+    printf '  \033[0;31mFAIL\033[0m  安装路径没有调用 config_gate —— B1 类 bug 会复活\n'
+    FAIL=$((FAIL + 1))
+fi
+if grep -qE '^[[:space:]]*\[ "\$VAL_ERRORS" -eq 0 \][[:space:]]*$' "$SCRIPT"; then
+    printf '  \033[0;32mPASS\033[0m  validate_config 按 VAL_ERRORS 决定返回码\n'
+    PASS=$((PASS + 1))
+else
+    printf '  \033[0;31mFAIL\033[0m  validate_config 没有按 VAL_ERRORS 返回(闸门失效)\n'
     FAIL=$((FAIL + 1))
 fi
 

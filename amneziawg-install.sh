@@ -118,7 +118,17 @@ else
 fi
 
 # ---------------- 日志与输出 ----------------
-: > "$LOG_FILE" 2>/dev/null || LOG_FILE=/dev/null
+# 安全: 本脚本以 root 运行, 日志路径固定写在 /tmp —— 必须防两件事
+#   ① 符号链接攻击: 本机普通用户预先在 /tmp 造同名软链指向 /etc/shadow, root 一跑就把它清空
+#   ② 日志本身被全局可读: 里面会记到 Endpoint / 隧道地址 / 出口 IP / 混淆参数(准密钥材料)
+if [ -L "$LOG_FILE" ]; then
+    echo "警告: $LOG_FILE 是符号链接(疑似符号链接攻击), 本次不写日志" >&2
+    LOG_FILE=/dev/null
+elif (umask 077; : > "$LOG_FILE") 2>/dev/null; then
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
+else
+    LOG_FILE=/dev/null
+fi
 log()  { echo "[$(date +%H:%M:%S)] $*" >> "$LOG_FILE" 2>/dev/null || true; }
 ok()   { echo -e "      ${GREEN}✓${RESET} $*"; log "OK: $*"; }
 warn() { echo -e "      ${YELLOW}⚠${RESET}  $*"; log "WARN: $*"; }
@@ -166,36 +176,51 @@ ask_choice() {
 # ============================================================
 # 配置解析 helper
 #   conf_get <file> <section> <key>  —— 只取指定段里的键, 规避 [Peer] 段同名干扰
+#
+#   段头识别必须和 awg-quick 自己的解析器对齐(否则"能起但校验说缺段"):
+#   awg-quick 先砍掉 # 之后的内容, 再把 key 前后空白 trim, 然后才比 "[Interface]";
+#   所以 "  [Interface]" 和 "[Interface]  # 注释" 都是它认的合法段头。
+#   (老版本这里只认第 0 列的裸 [Interface], 对上面两种写法会误报"缺少 [Interface] 段"。)
 # ============================================================
 conf_get() {
     awk -v want="$2" -v key="$3" '
-        /^[[:space:]]*\[/ {
-            sec = $0
-            gsub(/[[:space:]\[\]]/, "", sec)
-            next
-        }
-        sec == want {
+        {
             line = $0
             sub(/#.*/, "", line)
-            n = index(line, "=")
-            if (n == 0) next
-            k = substr(line, 1, n - 1); gsub(/[[:space:]]/, "", k)
-            if (k == key) {
-                v = substr(line, n + 1)
-                gsub(/^[[:space:]]+/, "", v); gsub(/[[:space:]]+$/, "", v)
-                print v
-                exit
+            t = line
+            sub(/^[[:space:]]+/, "", t); sub(/[[:space:]]+$/, "", t)
+            if (t ~ /^\[/) {
+                sec = t
+                gsub(/[[:space:]\[\]]/, "", sec)
+                next
+            }
+            if (sec == want) {
+                n = index(line, "=")
+                if (n == 0) next
+                k = substr(line, 1, n - 1); gsub(/[[:space:]]/, "", k)
+                if (k == key) {
+                    v = substr(line, n + 1)
+                    sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+                    print v
+                    exit
+                }
             }
         }
     ' "$1" 2>/dev/null || true
 }
 
-# 取所有段名, 用于校验段完整性
+# 取所有段名, 用于校验段完整性(同样容忍缩进与行尾注释)
 conf_sections() {
-    awk '/^[[:space:]]*\[/ {
-            sec = $0
-            gsub(/[[:space:]\[\]]/, "", sec)
-            print sec
+    awk '
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line)
+            if (line ~ /^\[/) {
+                sec = line
+                gsub(/[[:space:]\[\]]/, "", sec)
+                print sec
+            }
         }' "$1" 2>/dev/null || true
 }
 
@@ -343,11 +368,14 @@ validate_config() {
             val_warn "Jc=$jc 超出上游 README 建议范围 1-128(常用 4-12, 越大开销越高)"
         fi
     fi
-    # Jmin/Jmax: uint16, Jmin < Jmax, 且 Jmax 不应达到/超过 MTU(上游 README: < 1280)
+    # Jmin/Jmax: uint16, Jmin <= Jmax, 且 Jmax 不应达到/超过 MTU(上游 README: < 1280)
+    #   注意口径差异: 内核模块 README 写 `Jmax > Jmin`(严格), 但 amneziawg-go README 写 `Jmin <= Jmax`;
+    #   三端代码都不校验这一条。真正会出事的只有 Jmin > Jmax(内核 send.c 的无符号区间会下溢),
+    #   所以这里只拦 > —— Jmin == Jmax 是合法配置, 不能误拦。
     if [ -n "$jmin" ] && uint16_check Jmin "$jmin"; then :; fi
     if [ -n "$jmax" ] && uint16_check Jmax "$jmax"; then :; fi
     if [ -n "$jmin" ] && [ -n "$jmax" ] && is_uint "$jmin" && is_uint "$jmax"; then
-        [ "$jmin" -lt "$jmax" ] || val_err "Jmin($jmin) 必须小于 Jmax($jmax)"
+        [ "$jmin" -le "$jmax" ] || val_err "Jmin($jmin) 不能大于 Jmax($jmax) —— 垃圾包大小区间反了, 内核侧会算出非法长度"
         [ "$jmax" -lt 1280 ] || val_warn "Jmax=$jmax 达到/超过 1280 —— 上游 README 建议 Jmax < 1280, 否则垃圾包会被分片"
     fi
     # S1/S2: uint16, S1+56 != S2, 上限按上游 README(S1<=1132, S2<=1188, 以 MTU 1280 估算)
@@ -364,13 +392,15 @@ validate_config() {
             val_err "配置用了 HeaderProtectionKey, 但 S2=$s2 < 12 —— 内核侧要求开 header protection 时 S1-S4 至少 12"
         fi
     fi
+    # S1+56 == S2: 文档建议级约束(内核 README 明列, 但三端代码都不校验, awk setconf 照样接受),
+    #   且接收端还有 H1/H2 报文类型码兜底 → 只提示, 不当错误拦(否则比上游工具本身还严, 会误拦可用配置)
     if [ -n "$s1" ] && [ -n "$s2" ] && is_uint "$s1" && is_uint "$s2"; then
-        [ $((s1 + 56)) -ne "$s2" ] || val_err "S1+56 不能等于 S2: S1=$s1 会算出 S2=$((s1 + 56)), 此时 Init 包(148+S1)与 Response 包(92+S2)等长, 接收端无法按长度区分包类型(上游 README 明列此约束)"
+        [ $((s1 + 56)) -ne "$s2" ] || val_warn "S1+56 恰好等于 S2(S1=$s1): Init 包(148+S1)与 Response 包(92+S2)等长, 按长度区分包类型的做法会失效(上游 README 建议避开; 接收端通常还能靠 H 类型码兜底)"
     fi
 
-    # H1..H4: range<uint32> + 两两区间不重叠(官方文档硬约束)
+    # H1..H4: range<uint32> + 两两区间不重叠(官方文档硬约束 + 内核 netlink.c 会 -EINVAL)
     local hk hs i low high
-    local -a HLO=() HHI=()
+    local -a HLO=() HHI=() HNAME=()   # 连字段名一起存, 否则某个 H 值格式非法被跳过时编号会整体前移、报错指错字段
     for hk in H1 H2 H3 H4; do
         hs=$(conf_get "$f" Interface "$hk")
         [ -n "$hs" ] || continue
@@ -386,7 +416,7 @@ validate_config() {
             val_warn "$hk=$hs 是官方特殊值($hk 等于 $low 表示禁用 $hk)"
         fi
         [ "$low" -ge 5 ] || val_warn "$hk 起始值 $low 偏小(上游建议 >= 5)"
-        HLO+=("$low"); HHI+=("$high")
+        HLO+=("$low"); HHI+=("$high"); HNAME+=("$hk")
     done
     local n=${#HLO[@]}
     if [ "$n" -gt 1 ]; then
@@ -394,7 +424,7 @@ validate_config() {
         for ((i = 0; i < n; i++)); do
             for ((j = i + 1; j < n; j++)); do
                 if [ "${HLO[$i]}" -le "${HHI[$j]}" ] && [ "${HLO[$j]}" -le "${HHI[$i]}" ]; then
-                    val_err "H 字段区间重叠(H$((i + 1))=${HLO[$i]}-${HHI[$i]} 与 H$((j + 1))=${HLO[$j]}-${HHI[$j]}): 官方文档要求 H1-H4 区间不得重叠"
+                    val_err "H 字段区间重叠(${HNAME[$i]}=${HLO[$i]}-${HHI[$i]} 与 ${HNAME[$j]}=${HLO[$j]}-${HHI[$j]}): 官方文档要求 H1-H4 区间不得重叠(内核会直接拒绝)"
                 fi
             done
         done
@@ -411,7 +441,17 @@ validate_config() {
         fi
     fi
 
-    return 0
+    # 统一的退出点: 只要有错误级问题就返回非 0。
+    #   ⚠️ 这个 return 值就是"能否继续安装"的唯一判据 ——
+    #   历史教训: 早期版本这里恒 return 0, 而主流程只看返回码, 导致"拦住残废配置"
+    #   这个核心承诺在安装路径上完全失效(只在 --validate-config 路径生效)。
+    [ "$VAL_ERRORS" -eq 0 ]
+}
+
+# 单一出口的校验闸: 主流程与 --validate-config 都调它, 避免两条路径结论不一致
+config_gate() {  # 用法: if ! config_gate <file>; then ... fi
+    validate_config "$1" || true
+    [ "$VAL_ERRORS" -eq 0 ]
 }
 
 # CRLF → LF 归一化
@@ -426,7 +466,9 @@ normalize_crlf() {
     if [ "${n:-0}" -gt 0 ]; then
         warn "配置里有 $n 个 CR 字符(Windows 行尾) —— 已自动转成 LF; 否则 awg-quick 解析时会把行尾回车符带进值里, 连不上还查不出原因"
         tmpf="$f.lf.$$"
-        if tr -d '\r' < "$f" > "$tmpf" 2>/dev/null; then
+        # 这份临时文件里是含 PrivateKey 的配置 —— 必须继承原文件权限, 不能按 umask 放开
+        if (umask 077; tr -d '\r' < "$f" > "$tmpf") 2>/dev/null; then
+            chmod --reference="$f" "$tmpf" 2>/dev/null || chmod 600 "$tmpf" 2>/dev/null || true
             mv "$tmpf" "$f"
         else
             rm -f "$tmpf"
@@ -444,16 +486,12 @@ if [ -n "$VALIDATE_ONLY" ]; then
         exit 2
     fi
     echo "校验配置: $VALIDATE_ONLY"
-    # 校验用副本, 绝不改动用户给的原文件
+    # 校验用副本, 绝不改动用户给的原文件(且副本按 0600 建, 里面含私钥)
     VCHECK=$(mktemp /tmp/awg-check.XXXXXX)
     trap 'rm -f "$VCHECK"' EXIT
     cat "$VALIDATE_ONLY" > "$VCHECK"
     normalize_crlf "$VCHECK"
-    if validate_config "$VCHECK"; then
-        if [ "$VAL_ERRORS" -gt 0 ]; then
-            echo "结果: 不通过(错误 $VAL_ERRORS, 提示 $VAL_WARNINGS)"
-            exit 1
-        fi
+    if config_gate "$VCHECK"; then
         echo "结果: 通过(提示 $VAL_WARNINGS 条)"
         exit 0
     fi
@@ -571,21 +609,39 @@ esac
 
 apt_has_candidate() { apt-cache policy "$1" 2>/dev/null | grep -q 'Candidate: [0-9]'; }
 
-# Debian 专用: 上游 PPA 没有 Debian 代号, 按官方文档写死 ubuntu focal
-apt_add_ppa_manual() {
+# apt 路线需要的最小工具(两条分支都要用, 所以提前装)
+apt_ensure_tools() {
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl gnupg2 ca-certificates >> "$LOG_FILE" 2>&1 || true
+}
+
+# 宿主代号(用于给 PPA 选对口袋); 取不到就回退到 VERSION_CODENAME/UBUNTU_CODENAME
+apt_codename() {
+    local c="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+    [ -n "$c" ] || c=$(lsb_release -sc 2>/dev/null || true)
+    printf '%s' "$c"
+}
+
+# PPA 的签名公钥: 只用实测可用的一条路。
+#   ⚠️ 曾写过 https://api.launchpad.net/1.0/~amnezia/+archive/ubuntu/ppa?ws.op=getSigningKeyData,
+#   实测该 ws.op 不存在(HTTP 400 No such operation), 那条分支永远不会成功 —— 已删掉, 别再加回来。
+apt_fetch_ppa_key() {
     local keyring=/usr/share/keyrings/amneziawg.gpg
     mkdir -p /usr/share/keyrings
-    # 优先用 Launchpad API 取签名公钥(比 keyserver 稳, 不需要短 keyid)
-    if curl -fsSL "https://api.launchpad.net/1.0/~amnezia/+archive/ubuntu/ppa?ws.op=getSigningKeyData" \
+    if curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" 2>>"$LOG_FILE" \
          | gpg --dearmor > "$keyring" 2>>"$LOG_FILE"; then
-        :
-    elif curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" \
-         | gpg --dearmor > "$keyring" 2>>"$LOG_FILE"; then
-        :
-    else
-        warn "无法获取 PPA 签名公钥"
-        return 1
+        chmod 644 "$keyring" 2>/dev/null || true
+        printf '%s' "$keyring"
+        return 0
     fi
+    rm -f "$keyring"
+    warn "无法从 keyserver 取 PPA 签名公钥"
+    return 1
+}
+
+# Debian 专用: 上游 PPA 没有 Debian 代号, 按官方文档写死 ubuntu focal(有风险, 失败即源码编译)
+apt_add_ppa_manual() {
+    local keyring
+    keyring=$(apt_fetch_ppa_key) || return 1
     echo "deb [signed-by=$keyring] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" \
         > /etc/apt/sources.list.d/amneziawg.list
     info "已写入 /etc/apt/sources.list.d/amneziawg.list (ubuntu focal 源)"
@@ -635,14 +691,22 @@ install_tools_pkg() {
             if apt_has_candidate amneziawg-tools; then
                 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq amneziawg-tools >> "$LOG_FILE" 2>&1 && return 0
             fi
-            if [ "$DISTRO" = "debian" ] || [ "${DISTRO_LIKE%% *}" = "debian" ]; then
-                # Debian 无对应代号 → 官方文档路线(写死 focal 源)
+            # 两条分支都要 curl/gpg, 先补齐(最小化云镜像/容器里常常没有)
+            apt_ensure_tools
+            # 注意判定顺序: Ubuntu 的 os-release 是 ID=ubuntu + ID_LIKE=debian,
+            # 所以"是否真 Debian"绝不能只看 ID_LIKE(否则 Ubuntu 会被当成 Debian,
+            # 永远走写死 focal 的口袋, 那条 add-apt-repository 按宿主代号选口袋的路就成了死代码)。
+            if [ "$DISTRO" = "debian" ] && [ "${DISTRO_LIKE%% *}" != "ubuntu" ]; then
+                # 真 Debian: 上游 PPA 没有 Debian 代号 → 按官方文档写死 focal 源(有风险, 失败即源码编译)
+                info "Debian 无对应 PPA 代号 → 按官方文档用 ubuntu focal 源(可能因 libc/依赖不匹配失败, 失败会自动改源码编译)"
                 apt_add_ppa_manual || return 1
             else
                 info "添加上游 PPA: ppa:amnezia/ppa"
-                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq software-properties-common gnupg2 curl >> "$LOG_FILE" 2>&1 || true
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq software-properties-common >> "$LOG_FILE" 2>&1 || true
                 if command -v add-apt-repository >/dev/null 2>&1; then
+                    # add-apt-repository 会按宿主代号(如 26.04 的 resolute/stonking)自动选口袋
                     add-apt-repository -y ppa:amnezia/ppa >> "$LOG_FILE" 2>&1 || return 1
+                    info "已按宿主代号添加 PPA: $(apt_codename)"
                 else
                     apt_add_ppa_manual || return 1
                 fi
@@ -670,6 +734,14 @@ install_tools_pkg() {
             return 1
             ;;
         pacman)
+            # ⚠️ Arch 的 AUR 包必走 makepkg, 而 makepkg 硬拒 root
+            #   ("Running makepkg as root is not allowed ...", pacman 源码里的硬检查);
+            #   本脚本强制 root 运行 → yay/paru 这条路必然失败。
+            #   所以直接走源码编译(上游 README 的官方路线), 不再假装能用 AUR。
+            if [ "$(id -u)" -eq 0 ]; then
+                info "Arch: AUR/makepkg 不允许以 root 运行 → 直接走源码编译(上游 README 官方路线)"
+                return 1
+            fi
             if command -v yay >/dev/null 2>&1; then
                 yay -S --noconfirm --needed amneziawg-tools >> "$LOG_FILE" 2>&1 && return 0
             elif command -v paru >/dev/null 2>&1; then
@@ -905,7 +977,7 @@ fi
 # 行尾归一化(Windows 编辑过的配置会把 \r 带进值里, 详见 normalize_crlf 注释)
 normalize_crlf "$CONF_TMP"
 
-if ! validate_config "$CONF_TMP"; then
+if ! config_gate "$CONF_TMP"; then
     echo
     err "配置校验不通过(错误 $VAL_ERRORS 条)"
     echo
@@ -1006,13 +1078,19 @@ if [ -n "$SSH_IP" ] && [ "$FULL_TUNNEL" = "1" ]; then
 fi
 
 # 5.4 MTU(4G/5G 场景必须 <= 1280)
+#   两种都要管: ① 没设 MTU  ② 设了但偏大(如 1420) —— 后者老版本会直接跳过这个提示
 MTU_SET=0
-if [ "$FULL_TUNNEL" = "1" ] && [ -z "$CONF_MTU" ]; then
+MTU_OVER=0
+if [ -n "$CONF_MTU" ] && [ "$CONF_MTU" -gt 1280 ] 2>/dev/null; then MTU_OVER=1; fi
+if [ "$FULL_TUNNEL" = "1" ] && { [ -z "$CONF_MTU" ] || [ "$MTU_OVER" = 1 ]; }; then
     echo
     info "全流量模式下, MTU 没设时由 awg-quick 自动推算"
     info "经 4G/5G 拨入(车机/CPE/手机热点)时 MTU 必须 <= 1280, 否则能握手但打不开网页"
+    if [ "$MTU_OVER" = 1 ]; then
+        warn "你的配置里是 MTU = $CONF_MTU, 偏大"
+    fi
     if ask "写入 MTU = 1280? [Y/n]: " "Y"; then
-        MTU_SET=1280; ok "将写入 MTU = 1280"
+        MTU_SET=1280; ok "将写入 MTU = 1280(覆盖原值)"
     fi
 fi
 
@@ -1082,34 +1160,90 @@ DNS_DOWN_EOF
     chmod 755 "$AWG_DIR/$IFNAME-dns-down.sh"
 fi
 
-# MTU 注入 [Interface] 段
+# ---------- 往 [Interface] 段内插行 ----------
+# 之所以专门写个函数, 是因为手写的 awk 匹配踩过两个坑:
+#   ① 段头只认第 0 列的裸 "[Interface]" —— 而 awg-quick 自己的解析器会把 key 前后空白 trim,
+#      所以 "  [Interface]" / "[Interface]  # 注释" 都是它认的合法配置; 老写法对这类配置**静默漏插**
+#      (用户被告知写了 MTU / 加了保护规则, 实际一行都没写进去), 结果是"隧道起来了但域名全解析不了"。
+#   ② 老写法把 PostUp 插在"第一个 [Peer] 之前"就等于插在 [Interface] 段内 —— 这个假设只在
+#      [Interface] 排第一时成立; [Peer] 写在前面的配置会让 PostUp 落到所有段之外,
+#      awg setconf 直接报 `Line unrecognized' 起不来。
+#   现在: 插到"第一个非 [Interface] 的段头"之前(= [Interface] 段末尾); 没有其它段就追加到文件末尾。
+inject_into_interface() {  # inject_into_interface <file> <payload(可含多行, 以 \n 结尾)>
+    local f="$1" payload="$2" tmp
+    tmp=$(mktemp)
+    if ! awk -v inject="$payload" '
+        function ltrim(s) { sub(/^[[:space:]]+/, "", s); return s }
+        function is_sec(s)   { return (ltrim(s) ~ /^\[/) }
+        function is_iface(s) {
+            s = ltrim(s); sub(/[[:space:]]*#.*$/, "", s); sub(/[[:space:]]+$/, "", s)
+            return (s == "[Interface]")
+        }
+        {
+            if (!done && seen_iface && is_sec($0) && !is_iface($0)) { printf "%s", inject; done = 1 }
+            if (is_iface($0)) seen_iface = 1
+            print
+        }
+        END { if (!done && seen_iface) printf "%s", inject }
+    ' "$f" > "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    if cmp -s "$f" "$tmp"; then rm -f "$tmp"; return 1; fi   # 内容没变 = 没插进去
+    mv "$tmp" "$f"
+    return 0
+}
+
+# MTU 写入: 配置里已有 MTU 就**替换**(不能追加第二行 —— 虽然 awg-quick 取最后一个,
+# 但留两行 MTU 会让人看不懂生效的是哪个), 没有才注入
+set_mtu_in_config() {  # set_mtu_in_config <file> <value>
+    local f="$1" val="$2" tmp
+    if grep -qE '^[[:space:]]*MTU[[:space:]]*=' "$f"; then
+        tmp=$(mktemp)
+        if awk -v mtu="$val" '
+            /^[[:space:]]*MTU[[:space:]]*=/ { print "MTU = " mtu; next }
+            { print }
+        ' "$f" > "$tmp"; then
+            mv "$tmp" "$f"; return 0
+        fi
+        rm -f "$tmp"; return 1
+    fi
+    inject_into_interface "$f" "MTU = $val"$'\n'
+}
+
+# MTU 注入
 if [ "$MTU_SET" != 0 ]; then
-    TMP_M=$(mktemp)
-    if awk -v mtu="$MTU_SET" '
-        { print }
-        /^\[Interface\][[:space:]]*$/ && !done { print "MTU = " mtu; done = 1 }
-    ' "$CONF_TMP" > "$TMP_M"; then
-        mv "$TMP_M" "$CONF_TMP"
+    if set_mtu_in_config "$CONF_TMP" "$MTU_SET"; then
+        : # 已在上面打过 "将写入 MTU = 1280"
     else
-        rm -f "$TMP_M"
-        warn "MTU 注入失败, 保持原配置"
+        warn "MTU 写入失败(没找到 [Interface] 段) —— 配置将不带 MTU, 请手工加一行 MTU = $MTU_SET"
     fi
 fi
 
-# PostUp/PostDown 注入(放在第一个 [Peer] 之前, 保证在 [Interface] 段内)
+# PostUp/PostDown / PreDown 注入
 INJECT=""
 if [ -n "$DNS_LINE" ]; then
     INJECT+="PostUp = $AWG_DIR/$IFNAME-dns-up.sh"$'\n'
     INJECT+="PostDown = $AWG_DIR/$IFNAME-dns-down.sh"$'\n'
 fi
 if [ "$SSH_PROTECT" = "1" ] && [ -n "$SSH_IP" ]; then
-    DEFAULT_GW=$(ip route show default | awk '/default/ {print $3; exit}')
-    DEFAULT_IF=$(ip route show default | awk '/default/ {print $5; exit}')
-    if [ -n "$DEFAULT_GW" ] && [ -n "$DEFAULT_IF" ]; then
-        INJECT+="PostUp = ip route add ${SSH_IP}/32 via ${DEFAULT_GW} dev ${DEFAULT_IF}"$'\n'
+    # 解析默认路由时不能按字段位置硬取: 设备型默认路由(PPP/4G)是
+    #   "default dev ppp0 scope link" —— 没有 via, $3/$5 会取到 ppp0/link,
+    #   拼出的 "ip route add X/32 via ppp0 dev link" 必然失败,
+    #   而 PostUp 失败会让 awg-quick up/down 整体失败(上游是 set -e) → 隧道起不来。
+    DEFAULT_GW=$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}')
+    DEFAULT_IF=$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    SSH_ROUTE=""
+    if [ -n "$DEFAULT_IF" ] && [ -n "$DEFAULT_GW" ]; then
+        SSH_ROUTE="ip route add ${SSH_IP}/32 via ${DEFAULT_GW} dev ${DEFAULT_IF}"
+    elif [ -n "$DEFAULT_IF" ]; then
+        SSH_ROUTE="ip route add ${SSH_IP}/32 dev ${DEFAULT_IF}"
+        info "默认路由是设备型(无 via), SSH 保护用 ${SSH_ROUTE}"
+    fi
+    if [ -n "$SSH_ROUTE" ]; then
+        INJECT+="PostUp = $SSH_ROUTE"$'\n'
         INJECT+="PostDown = ip route del ${SSH_IP}/32"$'\n'
     else
-        warn "未找到默认网关, SSH 保护规则跳过"
+        warn "无法解析默认路由, SSH 保护规则跳过(启动后这条 SSH 可能断)"
     fi
 fi
 if [ "$KILL_SWITCH" = "1" ]; then
@@ -1119,17 +1253,24 @@ if [ "$KILL_SWITCH" = "1" ]; then
 fi
 
 if [ -n "$INJECT" ]; then
-    TMP2=$(mktemp)
-    if awk -v inject="$INJECT" '
-        BEGIN { done = 0 }
-        /^\[Peer\]/ && !done { printf "%s", inject; done = 1 }
-        { print }
-    ' "$CONF_TMP" > "$TMP2"; then
-        mv "$TMP2" "$CONF_TMP"
+    if inject_into_interface "$CONF_TMP" "$INJECT"; then
+        ok "已写入 PostUp/PostDown 规则(验证: 段内注入, 不在段外)"
     else
-        rm -f "$TMP2"
-        warn "PostUp/PostDown 注入失败, 保持原配置"
+        warn "PostUp/PostDown 注入失败 —— 请手工把上面这些行加到 [Interface] 段里"
+        warn "否则可能出现: 隧道起来了但 /etc/resolv.conf 没被改写(DNS 自管失效)"
     fi
+fi
+
+# 落盘前自检: 确认注入的规则确实在 [Interface] 段里(而不是被插到段外)
+if [ -n "$INJECT" ] && ! awk '
+    function ltrim(s){sub(/^[[:space:]]+/,"",s); return s}
+    function is_sec(s){return (ltrim(s) ~ /^\[/)}
+    function is_iface(s){s=ltrim(s); sub(/[[:space:]]*#.*$/,"",s); sub(/[[:space:]]+$/,"",s); return (s=="[Interface]")}
+    { if (is_iface($0)) ins=1; else if (is_sec($0)) ins=0
+      if (ins && $0 ~ /^[[:space:]]*PostUp[[:space:]]*=/) f=1 }
+    END { exit !f }
+' "$CONF_TMP"; then
+    warn "自检未发现 [Interface] 段内的 PostUp 行, 请人工确认配置"
 fi
 
 install -m 600 "$CONF_TMP" "$CFG_PATH"
@@ -1140,20 +1281,77 @@ info "想改配置: sudo vi $CFG_PATH 然后 sudo awg-quick down $IFNAME && sudo
 
 # ---------- [6/7] 启动 ----------
 EXIT_IP=""; HANDSHAKE_OK=0; MODE_ACTUAL=""
+
+# 启动前的 Endpoint 预检: awg setconf 会自己解析 Endpoint 主机名, 解析不了就报
+#   "Name or service not known: `host:port'" + "Configuration parsing error"
+# —— 这是最容易被误读成"配置写错了"的一类失败(其实配置没问题, 是本机 DNS 解析不了)。
+# 提前查一次, 把真正的原因和查法摊给用户; 也提前给出"改用 IP"的绕法。
+ENDPOINT_HOST="${ENDPOINT%:*}"
+ENDPOINT_PORT="${ENDPOINT##*:}"
+preflight_endpoint() {
+    # 已经是 IP 就不需要解析
+    if printf '%s' "$ENDPOINT_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+       || printf '%s' "$ENDPOINT_HOST" | grep -q ':'; then
+        ok "Endpoint 是 IP, 不需要 DNS 解析"
+        return 0
+    fi
+    if getent hosts "$ENDPOINT_HOST" >/dev/null 2>&1; then
+        local ip; ip=$(getent hosts "$ENDPOINT_HOST" | awk 'NR==1{print $1}')
+        ok "Endpoint 域名可解析: $ENDPOINT_HOST -> $ip"
+        return 0
+    fi
+    warn "Endpoint 域名【解析不了】: $ENDPOINT_HOST"
+    info "这正是 \`Name or service not known' + \`Configuration parsing error' 的原因 ——"
+    info "不是配置写错了, 是这台机器现在解析不了这个名字(awg setconf 会自己解析 Endpoint)。"
+    echo
+    echo "  按顺序自查:"
+    echo "    cat /etc/resolv.conf          # 有没有可用 nameserver(只有 127.0.0.53 时看 systemd-resolved 是否活着)"
+    echo "    ping -c2 223.5.5.5            # 纯 IP 通不通(分清'没网'还是'只有 DNS 坏')"
+    echo "    getent hosts $ENDPOINT_HOST   # 换个工具复验"
+    echo
+    echo "  两条绕法:"
+    echo "    A) 修好 DNS 再重跑本脚本"
+    echo "    B) 找台能解析的机器查出 IP, 把配置改成 IP 直连:"
+    echo "         Endpoint = <IP>:$ENDPOINT_PORT"
+    echo "       改完: sudo awg-quick down $IFNAME && sudo awg-quick up $IFNAME"
+    echo "       (DDNS 换 IP 后要再改一次, 属临时手段; 根治还是修 DNS)"
+    return 1
+}
+
 if [ "$START" = "1" ]; then
     step 6 "启动隧道..."
+    preflight_endpoint || info "仍然继续尝试(万一 awg-quick 内的重试能等到 DNS 恢复)"
     if awg-quick up "$IFNAME" >> "$LOG_FILE" 2>&1; then
         ok "awg-quick up $IFNAME"
     else
         err "启动失败, 日志末尾:"
         tail -n 20 "$LOG_FILE" >&2
+        echo
+        # 按上游真实报错特征分流 —— 只说命中那条, 不让用户在一堆"常见原因"里猜
+        if grep -q 'Name or service not known' "$LOG_FILE"; then
+            err "命中原因: Endpoint 域名解析失败(见上一条预检)"
+            echo "        → 先修 DNS, 或把 Endpoint 改成 IP 后重试(上面绕法 B)"
+            echo "        → 若本机 DNS 依赖隧道自身, 会出现先有鸡还是先有蛋 —— 必须先用 IP 把隧道起起来"
+        elif grep -q 'Configuration parsing error' "$LOG_FILE"; then
+            err "命中原因: 配置解析失败 —— 配置里有 awg 不认识的键或格式"
+            echo "        → 检查: 键名拼写、密钥是否 44 字符 base64 且以 = 结尾、地址是否带掩码"
+            echo "        → 上游会指明是哪一行, 上面日志 \`Line unrecognized' 后面就是那行"
+        elif grep -qE 'already exists|Address already in use|File exists' "$LOG_FILE"; then
+            err "命中原因: 接口/地址已存在"
+            echo "        → 先关掉旧的: sudo awg-quick down $IFNAME(或用 --ifname 换个名字)"
+        elif grep -qE 'Operation not permitted|Permission denied' "$LOG_FILE"; then
+            err "命中原因: 权限不足(建接口/改路由都要 root)"
+            echo "        → sudo bash $0 ..."
+        else
+            err "未命中已知原因, 请把上面日志原样发出来"
+        fi
+        echo
         cat <<EOF >&2
-
-  常见原因:
+  其它可能(按可能性排序):
     1) 内核模块没装且 amneziawg-go 不在 PATH(awg-quick 无处回退)
        → 现在 PATH 里 amneziawg-go: $(command -v amneziawg-go 2>/dev/null || echo "无")
-    2) Address 与已存在的接口重叠(换个 --ifname, 或先 down 掉旧的)
-    3) 配置文件权限不对(本脚本已设 600)
+    2) Endpoint 那侧 UDP $ENDPOINT_PORT 被挡 —— 这不会让 up 失败, 只会"起来了但收 0B"
+    3) SSH 自保护注入的路由命令失败(设备型默认路由, 如 PPP/4G)
 
   完整日志: $LOG_FILE
 EOF

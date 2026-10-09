@@ -140,7 +140,8 @@ flowchart TB
 
 **最常见的坑**：GL.iNet 路由器的网页/二维码**默认按标准 WireGuard 生成配置，不带这些字段**。
 照抄过来的配置能"存下来"但客户端读不了 / 连不上（现场实测表现为：发 148B 收 0B）。
-本脚本会**直接拦住**这种配置并告诉你正确取法，而不是替你把字段瞎填上（瞎填的值跟服务端对不上，比不填更难查）。
+本脚本会**直接拦住**这种配置（校验不通过就**不往下装**，而不是装完再让你去猜为什么连不上），
+并告诉你正确取法 —— 而不是替你把字段瞎填上（瞎填的值跟服务端对不上，比不填更难查）。
 
 用的越少越安全？不是——**混淆参数不一致 = 连不上**。所以脚本默认拦，不默认放行；
 确实确认服务端没开混淆时，用 `--allow-incomplete` 显式放行。
@@ -190,12 +191,16 @@ sudo systemctl disable --now awg-quick@awg0   # 永久禁用
 
 ### 连不上时按顺序查
 
-1. `sudo awg show` —— 有没有 `latest handshake`？
+1. **启动直接失败、报 `Name or service not known: \`host:port'` + `Configuration parsing error`**
+   → 这是 **Endpoint 域名解析不了**，不是配置写错了（`awg setconf` 会自己解析 Endpoint，脚本在启动前会先预检并提示）。
+   查：`cat /etc/resolv.conf` → `ping -c2 223.5.5.5`（分清"没网"还是"只有 DNS 坏"）→ `getent hosts <你的 Endpoint 域名>`。
+   绕：找台能解析的机器查出 IP，把 `Endpoint` 直接写成 `IP:端口`（DDNS 换 IP 后要再改，根治还是修 DNS）。
+2. `sudo awg show` —— 有没有 `latest handshake`？
    - **没有握手**：`transfer` 是不是 `0 B received`？是的话服务端多半没登记本机公钥，或到 Endpoint 的 UDP 被挡
    - **有握手但打不开网页**：MTU 问题，试 `MTU = 1280`
-2. **`wg show` 是空的 → 这是正常的**，AmneziaWG 只能用 `awg` 看
-3. 混淆字段与服务端**逐字段对一遍**（尤其 `S1 S2 H1-H4`）
-4. 内核态还是用户态？`ip -d link show awg0` 看 link kind
+3. **`wg show` 是空的 → 这是正常的**，AmneziaWG 只能用 `awg` 看
+4. 混淆字段与服务端**逐字段对一遍**（尤其 `S1 S2 H1-H4`）
+5. 内核态还是用户态？`ip -d link show awg0` 看 link kind
 
 ### 卸载
 
@@ -207,6 +212,12 @@ sudo rm -rf /etc/amnezia/amneziawg
 sudo apt remove --purge amneziawg-tools amneziawg-dkms     # Debian/Ubuntu
 sudo dnf remove amneziawg-tools amneziawg-dkms             # RHEL 系
 sudo rm -f /usr/bin/awg /usr/bin/awg-quick                 # 源码编译装的
+# ⚠️ 下面这几样是本脚本自己装的, README 别漏(不然会留残留源/后门二进制):
+sudo rm -f /usr/local/bin/amneziawg-go                     # 用户态实现(本脚本装的)
+sudo rm -f /etc/apt/sources.list.d/amneziawg.list          # Debian/Ubuntu 加的上游源
+sudo rm -f /usr/share/keyrings/amneziawg.gpg               # 该源的签名公钥
+sudo rm -f /etc/resolv.conf.awg-install.bak                # DNS 自管的备份文件
+sudo rm -f /tmp/amneziawg-install.log /tmp/awg-conf.* /tmp/awg-check.*
 ```
 
 ---
@@ -219,9 +230,24 @@ bash tests/run-tests.sh        # 配置校验器回归测试(纯离线, 无需 r
 
 用例覆盖：完整配置通过、全流量+MTU 通过、标准 WG 配置被拦、GL.iNet 残缺配置被拦、
 H 区间重叠被拦、数值越界/约束冲突被拦、缺客户端本地参数只提示、缺关键键被拦、
-CRLF（Windows）行尾自动归一化。
+CRLF（Windows）行尾自动归一化、`Jmin == Jmax` 不误拦、`S1+56 == S2` 只提示不拦、
+缩进/带注释的段头 + `[Peer]` 写在前的配置能正常识别。
+
+另含**静态守卫**两条：断言安装路径确实经过唯一的校验闸 `config_gate`、且 `validate_config`
+按 `VAL_ERRORS` 决定返回码 —— 行为测试测不到这条（历史上的 bug 正是"安装路径的闸失效、
+而 `--validate-config` 路径正常"，套件全绿也发现不了），只能用源码级断言钉住。
 
 CI：`.github/workflows/shellcheck.yml`（`bash -n` + shellcheck，severity=warning 即失败）。
+
+### 版本与网络请求说明
+
+- 本脚本按 **AmneziaWG 3.1**（`amneziawg-tools` 3.1.x / 内核模块 3.1.x / `amneziawg-go` v3）的协议与参数实现；
+  3.1 之前的版本混淆字段更少，脚本对"缺少新字段"只提示不拦。
+- 脚本会发起的对外请求：目标发行版软件源（PPA / COPR / AUR）、`github.com`（源码编译、`go install` 走
+  proxy.golang.org 或 goproxy.cn）、以及**连通性自检**时把本机出口 IP 发给
+  `api.ipify.org` → `ipinfo.io` → `ifconfig.me`（依次尝试，任一可用即停）。
+  **不收集、不回传任何用户数据**；含私钥的配置只写进本机 600 权限文件，且脚本自身不打印它
+  （日志也是 600，且拒绝写入符号链接）。不想发探测请求可在第 5 步选"不自动测试连通性"。
 
 ---
 
