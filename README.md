@@ -8,12 +8,39 @@
 
 ---
 
+## 先把脚本弄到目标机（⚠️ 本仓库是私有仓库）
+
+> **私有仓库的 raw 链接匿名访问会 404** —— 直接 `curl https://raw.githubusercontent.com/...` 拉不到东西。
+> 三条路任选：
+
+**A) 从已有副本直接传（最省事，目标机不需要任何 GitHub 凭据）**
+
+```bash
+scp amneziawg-install.sh root@<目标机>:/tmp/awg-install.sh
+ssh root@<目标机> 'sudo bash /tmp/awg-install.sh'
+```
+
+**B) 带 token 拉**（私有仓库唯一能 curl 通的写法）
+
+```bash
+curl -fsSL -H "Authorization: Bearer <YOUR_PAT>" \
+  https://raw.githubusercontent.com/NetApptool/amneziawg-install/main/amneziawg-install.sh \
+  -o /tmp/awg-install.sh
+sudo bash /tmp/awg-install.sh
+```
+
+> ⚠️ **`-H "Authorization: ..."` 只写在命令行里，绝不写进任何脚本、镜像或仓库文件**；
+> 命令行参数会短时出现在本机 `ps` 里，共享机器上先 `scp` 更稳。
+
+**C) 临时把仓库改 public**，用完再改回 private（不建议，容易忘）。
+
+---
+
 ## 30 秒上手
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NetApptool/amneziawg-install/main/amneziawg-install.sh -o /tmp/awg-install.sh
 sudo bash /tmp/awg-install.sh
-# 粘贴你的 AmneziaWG 配置(必须带 Jc/Jmin/Jmax/S1/S2/H1-H4 混淆字段), 按 Ctrl+D 结束
+# 粘贴你的 AmneziaWG 配置（必须带 Jc/Jmin/Jmax/S1/S2/H1-H4 混淆字段），按 Ctrl+D 结束
 ```
 
 无人值守 / 从文件读配置：
